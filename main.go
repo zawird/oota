@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"io"
 	"log"
@@ -37,6 +38,25 @@ func newOAuth2Config() *oauth2.Config {
 	}
 }
 
+// Check if the user is a member of the specified server
+func isUserInServer(client *http.Client, userID, serverID string) (bool, error) {
+	url := "https://discord.com/api/v10/guilds/" + serverID + "/members/" + userID
+	resp, err := client.Get(url)
+	if err != nil {
+		return false, err
+	}
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			log.Printf("Error closing response body: %v", closeErr)
+		}
+	}()
+
+	if resp.StatusCode == http.StatusOK {
+		return true, nil
+	}
+	return false, nil
+}
+
 func main() {
 	// Generate a secure state parameter
 	state, err := generateState()
@@ -45,6 +65,7 @@ func main() {
 	}
 
 	oauth2Config := newOAuth2Config()
+	serverID := os.Getenv("DISCORD_SERVER_ID")
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		url := oauth2Config.AuthCodeURL(state)
@@ -90,13 +111,43 @@ func main() {
 			return
 		}
 
+		var userInfo map[string]interface{}
+		if err := json.Unmarshal(body, &userInfo); err != nil {
+			log.Printf("Error unmarshalling user info: %v", err)
+			http.Error(w, "Failed to parse user info", http.StatusInternalServerError)
+			return
+		}
+
+		userID, ok := userInfo["id"].(string)
+		if !ok {
+			http.Error(w, "Failed to get user ID", http.StatusInternalServerError)
+			return
+		}
+
+		isMember, err := isUserInServer(client, userID, serverID)
+		if err != nil {
+			log.Printf("Error checking server membership: %v", err)
+			http.Error(w, "Failed to check server membership", http.StatusInternalServerError)
+			return
+		}
+
+		if !isMember {
+			http.Error(w, "You must join the specified Discord server to access this application.", http.StatusForbidden)
+			return
+		}
+
 		w.Header().Set("Content-Type", "application/json")
 		if _, err := w.Write(body); err != nil {
 			log.Printf("Error writing response: %v", err)
 		}
 	})
 
-	server := &http.Server{Addr: ":3000"}
+	// Use the port provided by the environment variable or default to 8080
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+	server := &http.Server{Addr: ":" + port}
 
 	// Start server in a goroutine
 	go func() {
