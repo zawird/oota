@@ -304,7 +304,13 @@ func main() {
 		}
 	})
 
-	server := &http.Server{Addr: ":3000"}
+	// Get the port from the environment, default to 3000 if not set
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "3000"
+	}
+
+	server := &http.Server{Addr: ":" + port}
 
 	// Start server in a goroutine
 	go func() {
