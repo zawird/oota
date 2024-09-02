@@ -14,11 +14,3 @@ This repository contains a simple Go server demonstrating OAuth2 integration wit
 
 - Go 1.16 or later
 - An account on [Discord Developer Portal](https://discord.com/developers/applications)
-
-## Setup
-
-1. **Clone the Repository**
-
-   ```sh
-   git clone https://github.com/zawird/oota.git
-   cd oota
