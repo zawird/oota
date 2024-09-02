@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -38,23 +39,45 @@ func newOAuth2Config() *oauth2.Config {
 	}
 }
 
-// Check if the user is a member of the specified server
-func isUserInServer(client *http.Client, userID, serverID string) (bool, error) {
-	url := "https://discord.com/api/v10/guilds/" + serverID + "/members/" + userID
-	resp, err := client.Get(url)
+// Check if the user is a member of the specified guild
+func isUserInGuild(userID, accessToken string) (bool, error) {
+	guildID := os.Getenv("DISCORD_GUILD_ID")
+	url := fmt.Sprintf("https://discord.com/api/v10/guilds/%s/members/%s", guildID, userID)
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("Authorization", "Bot "+accessToken)
+
+	client := &http.Client{}
+	res, err := client.Do(req)
 	if err != nil {
 		return false, err
 	}
 	defer func() {
-		if closeErr := resp.Body.Close(); closeErr != nil {
+		if closeErr := res.Body.Close(); closeErr != nil {
 			log.Printf("Error closing response body: %v", closeErr)
 		}
 	}()
 
-	if resp.StatusCode == http.StatusOK {
-		return true, nil
+	return res.StatusCode == http.StatusOK, nil
+}
+
+type User struct {
+	ID string `json:"id"`
+}
+
+// Extract user ID from the JSON response
+func extractUserID(body []byte) (string, error) {
+	var user User
+	if err := json.Unmarshal(body, &user); err != nil {
+		return "", fmt.Errorf("error unmarshalling user JSON: %w", err)
 	}
-	return false, nil
+	if user.ID == "" {
+		return "", errors.New("user ID not found in response")
+	}
+	return user.ID, nil
 }
 
 func main() {
@@ -65,7 +88,6 @@ func main() {
 	}
 
 	oauth2Config := newOAuth2Config()
-	serverID := os.Getenv("DISCORD_SERVER_ID")
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		url := oauth2Config.AuthCodeURL(state)
@@ -111,28 +133,27 @@ func main() {
 			return
 		}
 
-		var userInfo map[string]interface{}
-		if err := json.Unmarshal(body, &userInfo); err != nil {
-			log.Printf("Error unmarshalling user info: %v", err)
-			http.Error(w, "Failed to parse user info", http.StatusInternalServerError)
-			return
-		}
-
-		userID, ok := userInfo["id"].(string)
-		if !ok {
-			http.Error(w, "Failed to get user ID", http.StatusInternalServerError)
-			return
-		}
-
-		isMember, err := isUserInServer(client, userID, serverID)
+		// Extract the user ID from the response body (JSON parsing required)
+		userID, err := extractUserID(body)
 		if err != nil {
-			log.Printf("Error checking server membership: %v", err)
-			http.Error(w, "Failed to check server membership", http.StatusInternalServerError)
+			log.Printf("Error extracting user ID: %v", err)
+			http.Error(w, "Failed to extract user ID", http.StatusInternalServerError)
 			return
 		}
 
-		if !isMember {
-			http.Error(w, "You must join the specified Discord server to access this application.", http.StatusForbidden)
+		// Extract the access token for checking guild membership
+		accessToken := token.AccessToken
+		inGuild, err := isUserInGuild(userID, accessToken)
+		if err != nil {
+			log.Printf("Error checking guild membership: %v", err)
+			http.Error(w, "Failed to check guild membership", http.StatusInternalServerError)
+			return
+		}
+
+		if !inGuild {
+			// Redirect the user to join the Discord server
+			joinURL := fmt.Sprintf("https://discord.com/oauth2/authorize?client_id=%s&scope=bot&guild_id=%s&response_type=code", oauth2Config.ClientID, os.Getenv("DISCORD_GUILD_ID"))
+			http.Redirect(w, r, joinURL, http.StatusTemporaryRedirect)
 			return
 		}
 
@@ -142,12 +163,7 @@ func main() {
 		}
 	})
 
-	// Use the port provided by the environment variable or default to 8080
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
-	server := &http.Server{Addr: ":" + port}
+	server := &http.Server{Addr: ":3000"}
 
 	// Start server in a goroutine
 	go func() {
