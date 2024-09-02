@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -14,9 +15,20 @@ import (
 	"os/signal"
 	"time"
 
+	"github.com/bwmarrin/discordgo"
+	"github.com/dgrijalva/jwt-go"
 	"github.com/ravener/discord-oauth2"
 	"golang.org/x/oauth2"
 )
+
+// JWT secret key (should be stored securely, e.g., in environment variables)
+var jwtKey = []byte(os.Getenv("JWT_SECRET_KEY"))
+
+// Claims JWT claims structure
+type Claims struct {
+	DiscordID string `json:"discord_id"`
+	jwt.StandardClaims
+}
 
 // Securely generate a random state parameter
 func generateState() (string, error) {
@@ -34,7 +46,7 @@ func newOAuth2Config() *oauth2.Config {
 		ClientID:     os.Getenv("DISCORD_CLIENT_ID"),
 		ClientSecret: os.Getenv("DISCORD_CLIENT_SECRET"),
 		RedirectURL:  os.Getenv("DISCORD_REDIRECT_URI"),
-		Scopes:       []string{discord.ScopeIdentify, discord.ScopeGuilds},
+		Scopes:       []string{discord.ScopeIdentify, discord.ScopeGuildsJoin},
 		Endpoint:     discord.Endpoint,
 	}
 }
@@ -48,7 +60,7 @@ func isUserInGuild(userID, accessToken string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	req.Header.Set("Authorization", "Bot "+accessToken)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
 
 	client := &http.Client{}
 	res, err := client.Do(req)
@@ -64,23 +76,110 @@ func isUserInGuild(userID, accessToken string) (bool, error) {
 	return res.StatusCode == http.StatusOK, nil
 }
 
-type User struct {
-	ID string `json:"id"`
+// Automatically join user to the server
+func joinServer(userID, accessToken string) error {
+	guildID := os.Getenv("DISCORD_GUILD_ID")
+	url := fmt.Sprintf("https://discord.com/api/v10/guilds/%s/members/%s", guildID, userID)
+
+	payload := map[string]string{
+		"access_token": accessToken,
+	}
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest("PUT", url, bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bot "+os.Getenv("DISCORD_BOT_TOKEN"))
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	res, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := res.Body.Close(); closeErr != nil {
+			log.Printf("Error closing response body: %v", closeErr)
+		}
+	}()
+
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("failed to add user to guild: %s", res.Status)
+	}
+
+	return nil
 }
 
-// Extract user ID from the JSON response
-func extractUserID(body []byte) (string, error) {
-	var user User
-	if err := json.Unmarshal(body, &user); err != nil {
-		return "", fmt.Errorf("error unmarshalling user JSON: %w", err)
+// Generate a JWT token for session management
+func generateJWT(discordID string) (string, error) {
+	expirationTime := time.Now().Add(24 * time.Hour) // Token valid for 24 hours
+	claims := &Claims{
+		DiscordID: discordID,
+		StandardClaims: jwt.StandardClaims{
+			ExpiresAt: expirationTime.Unix(),
+		},
 	}
-	if user.ID == "" {
-		return "", errors.New("user ID not found in response")
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString(jwtKey)
+}
+
+// Verify JWT token
+func verifyJWT(tokenString string) (*Claims, error) {
+	claims := &Claims{}
+
+	token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {
+		return jwtKey, nil
+	})
+
+	if err != nil {
+		return nil, err
 	}
-	return user.ID, nil
+
+	if !token.Valid {
+		return nil, errors.New("invalid token")
+	}
+
+	return claims, nil
+}
+
+// Whitelist check to ensure bot only operates in your guild
+func isGuildWhitelisted(guildID string) bool {
+	return guildID == os.Getenv("DISCORD_GUILD_ID")
+}
+
+// Automatically leave any non-whitelisted server
+func onGuildJoin(s *discordgo.Session, g *discordgo.GuildCreate) {
+	if !isGuildWhitelisted(g.ID) {
+		fmt.Println("Bot was added to a non-whitelisted server. Leaving...")
+		if err := s.GuildLeave(g.ID); err != nil {
+			fmt.Printf("Failed to leave guild %s: %v\n", g.ID, err)
+		}
+	}
 }
 
 func main() {
+	// Initialize Discord session
+	dg, err := discordgo.New("Bot " + os.Getenv("DISCORD_BOT_TOKEN"))
+	if err != nil {
+		fmt.Println("error creating Discord session,", err)
+		return
+	}
+
+	// Register the guild join handler
+	dg.AddHandler(onGuildJoin)
+
+	// Open a websocket connection to Discord
+	err = dg.Open()
+	if err != nil {
+		fmt.Println("error opening connection,", err)
+		return
+	}
+
 	// Generate a secure state parameter
 	state, err := generateState()
 	if err != nil {
@@ -133,33 +232,75 @@ func main() {
 			return
 		}
 
-		// Extract the user ID from the response body (JSON parsing required)
-		userID, err := extractUserID(body)
-		if err != nil {
-			log.Printf("Error extracting user ID: %v", err)
+		// Extract the user ID from the response body
+		var user struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(body, &user); err != nil {
+			log.Printf("Error unmarshalling user JSON: %v", err)
 			http.Error(w, "Failed to extract user ID", http.StatusInternalServerError)
 			return
 		}
 
-		// Extract the access token for checking guild membership
-		accessToken := token.AccessToken
-		inGuild, err := isUserInGuild(userID, accessToken)
+		// Check if the user is already in the guild
+		inGuild, err := isUserInGuild(user.ID, token.AccessToken)
 		if err != nil {
-			log.Printf("Error checking guild membership: %v", err)
+			log.Printf("Error checking if user is in guild: %v", err)
 			http.Error(w, "Failed to check guild membership", http.StatusInternalServerError)
 			return
 		}
 
+		// If the user is not in the guild, join them
 		if !inGuild {
-			// Redirect the user to join the Discord server
-			joinURL := fmt.Sprintf("https://discord.com/oauth2/authorize?client_id=%s&scope=bot&guild_id=%s&response_type=code", oauth2Config.ClientID, os.Getenv("DISCORD_GUILD_ID"))
-			http.Redirect(w, r, joinURL, http.StatusTemporaryRedirect)
+			if err := joinServer(user.ID, token.AccessToken); err != nil {
+				log.Printf("Error adding user to server: %v", err)
+				http.Error(w, "Failed to add user to server", http.StatusInternalServerError)
+				return
+			}
+		}
+
+		// Generate a JWT for the session
+		jwtToken, err := generateJWT(user.ID)
+		if err != nil {
+			log.Printf("Error generating JWT: %v", err)
+			http.Error(w, "Failed to generate session token", http.StatusInternalServerError)
 			return
 		}
 
-		w.Header().Set("Content-Type", "application/json")
-		if _, err := w.Write(body); err != nil {
-			log.Printf("Error writing response: %v", err)
+		// Set the JWT as a cookie
+		http.SetCookie(w, &http.Cookie{
+			Name:    "session_token",
+			Value:   jwtToken,
+			Expires: time.Now().Add(24 * time.Hour),
+		})
+
+		// Redirect to the game or another protected resource
+		http.Redirect(w, r, "/game", http.StatusFound)
+	})
+
+	http.HandleFunc("/game", func(w http.ResponseWriter, r *http.Request) {
+		// Extract the session token from the cookie
+		cookie, err := r.Cookie("session_token")
+		if err != nil {
+			if errors.Is(err, http.ErrNoCookie) {
+				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				return
+			}
+			http.Error(w, "Bad Request", http.StatusBadRequest)
+			return
+		}
+
+		// Verify the session token
+		claims, err := verifyJWT(cookie.Value)
+		if err != nil {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		// The user is authenticated; proceed with the game logic
+		_, err = fmt.Fprintf(w, "Welcome to the game, user ID: %s", claims.DiscordID)
+		if err != nil {
+			return
 		}
 	})
 
