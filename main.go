@@ -27,6 +27,7 @@ var jwtKey = []byte(os.Getenv("JWT_SECRET_KEY"))
 // Claims JWT claims structure
 type Claims struct {
 	DiscordID string `json:"discord_id"`
+	Username  string `json:"username"`
 	jwt.StandardClaims
 }
 
@@ -115,10 +116,11 @@ func joinServer(userID, accessToken string) error {
 }
 
 // Generate a JWT token for session management
-func generateJWT(discordID string) (string, error) {
+func generateJWT(discordID, username string) (string, error) {
 	expirationTime := time.Now().Add(24 * time.Hour) // Token valid for 24 hours
 	claims := &Claims{
 		DiscordID: discordID,
+		Username:  username, // Include the username in the token
 		StandardClaims: jwt.StandardClaims{
 			ExpiresAt: expirationTime.Unix(),
 		},
@@ -246,7 +248,8 @@ func main() {
 
 		// Extract the user ID from the response body
 		var user struct {
-			ID string `json:"id"`
+			ID       string `json:"id"`
+			Username string `json:"username"`
 		}
 		if err := json.Unmarshal(body, &user); err != nil {
 			log.Printf("Error unmarshalling user JSON: %v", err)
@@ -272,7 +275,7 @@ func main() {
 		}
 
 		// Generate a JWT for the session
-		jwtToken, err := generateJWT(user.ID)
+		jwtToken, err := generateJWT(user.ID, user.Username)
 		if err != nil {
 			log.Printf("Error generating JWT: %v", err)
 			http.Error(w, "Failed to generate session token", http.StatusInternalServerError)
@@ -287,7 +290,10 @@ func main() {
 		})
 
 		// Redirect to the game or another protected resource
-		http.Redirect(w, r, "/game", http.StatusFound)
+		_, err = w.Write([]byte(`{"status":"success", "message":"Login successful"}`))
+		if err != nil {
+			return
+		}
 	})
 
 	http.HandleFunc("/game", func(w http.ResponseWriter, r *http.Request) {
