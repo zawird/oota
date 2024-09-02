@@ -162,6 +162,15 @@ func onGuildJoin(s *discordgo.Session, g *discordgo.GuildCreate) {
 	}
 }
 
+// Simple "wake-up" handler
+func handleWakeUp(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	_, err := w.Write([]byte("Server is awake"))
+	if err != nil {
+		return
+	}
+}
+
 func main() {
 	// Initialize Discord session
 	dg, err := discordgo.New("Bot " + os.Getenv("DISCORD_BOT_TOKEN"))
@@ -187,6 +196,9 @@ func main() {
 	}
 
 	oauth2Config := newOAuth2Config()
+
+	// Add the wake-up handler
+	http.HandleFunc("/wake-up", handleWakeUp)
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		url := oauth2Config.AuthCodeURL(state)
